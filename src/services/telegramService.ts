@@ -51,19 +51,17 @@ export function formatAlertMessage(alert: Alert): string {
 }
 
 /**
- * Send alert to all subscribed users
+ * Send alert to all subscribed users (parallel)
  */
 export async function broadcastAlert(
   botToken: string,
   alert: Alert
 ): Promise<number> {
   const message = formatAlertMessage(alert);
-  let sentCount = 0;
 
-  for (const chatId of alert.chatIds) {
-    const success = await sendTelegramMessage(botToken, chatId, message);
-    if (success) sentCount++;
-  }
+  const results = await Promise.all(
+    alert.chatIds.map((chatId) => sendTelegramMessage(botToken, chatId, message))
+  );
 
-  return sentCount;
+  return results.filter(Boolean).length;
 }
