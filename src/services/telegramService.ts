@@ -1,4 +1,3 @@
-import axios, { AxiosError } from 'axios';
 import { Alert } from '../types';
 
 const BATCH_SIZE = 20;
@@ -10,78 +9,81 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function getRetryDelayMs(attempt: number, error: unknown): number {
-  const axiosError = error as AxiosError<{ parameters?: { retry_after?: number } }>;
-  const retryAfterSec = axiosError?.response?.data?.parameters?.retry_after;
-
+function getRetryDelayMs(attempt: number, retryAfterSec?: number): number {
   if (typeof retryAfterSec === 'number' && retryAfterSec > 0) {
     return retryAfterSec * 1000;
   }
-
   return INITIAL_BACKOFF_MS * 2 ** (attempt - 1);
 }
 
-function isRetryableError(error: unknown): boolean {
-  const axiosError = error as AxiosError;
-  const status = axiosError?.response?.status;
-
-  if (!status) return true; // network / timeout / unknown transient errors
-  if (status === 429) return true;
-  if (status >= 500) return true;
-  return false;
+function isRetryableStatus(status?: number): boolean {
+  if (!status) return true; // network/unknown
+  return status === 429 || status >= 500;
 }
 
 /**
- * Send Telegram message to chat with retry
+ * Send Telegram message to chat with retry (Cloudflare-friendly)
  */
 export async function sendTelegramMessage(
   botToken: string,
   chatId: string,
   message: string
 ): Promise<boolean> {
+  const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const response = await axios.post(
-        `https://api.telegram.org/bot${botToken}/sendMessage`,
-        {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
           chat_id: chatId,
           text: message,
           parse_mode: 'HTML',
-        }
-      );
+        }),
+      });
 
-      const success = response.status === 200;
-      if (success) {
-        console.log(`[Telegram] ✅ sent to ${chatId} (attempt ${attempt})`);
-      } else {
-        console.warn(
-          `[Telegram] ⚠️ non-200 for ${chatId}: ${response.status} (attempt ${attempt})`
-        );
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch {
+        // ignore JSON parse failure
       }
 
-      return success;
-    } catch (error) {
-      const axiosError = error as AxiosError;
-      const status = axiosError?.response?.status;
-      const reason =
-        axiosError?.response?.statusText || axiosError?.message || 'Unknown error';
+      if (res.ok) {
+        console.log(`[Telegram] ✅ sent to ${chatId} (attempt ${attempt})`);
+        return true;
+      }
 
-      const retryable = isRetryableError(error);
-      const lastAttempt = attempt === MAX_RETRIES;
-
+      const retryAfterSec = data?.parameters?.retry_after as number | undefined;
+      const reason = data?.description || res.statusText || 'Unknown error';
       console.error(
-        `[Telegram] ❌ failed to send to ${chatId} (attempt ${attempt}/${MAX_RETRIES})` +
-          `${status ? ` status=${status}` : ''} reason=${reason}`
+        `[Telegram] ❌ failed to send to ${chatId} (attempt ${attempt}/${MAX_RETRIES}) status=${res.status} reason=${reason}`
       );
+
+      const retryable = isRetryableStatus(res.status);
+      const lastAttempt = attempt === MAX_RETRIES;
 
       if (!retryable || lastAttempt) {
         if (!retryable) {
-          console.error(`[Telegram] ⛔ non-retryable error for ${chatId}, stop retrying.`);
+          console.error(`[Telegram] ⛔ non-retryable status for ${chatId}, stop retrying.`);
         }
         return false;
       }
 
-      const delayMs = getRetryDelayMs(attempt, error);
+      const delayMs = getRetryDelayMs(attempt, retryAfterSec);
+      console.log(`[Telegram] 🔁 retrying ${chatId} in ${delayMs}ms...`);
+      await sleep(delayMs);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : 'Unknown error';
+      console.error(
+        `[Telegram] ❌ network/runtime error for ${chatId} (attempt ${attempt}/${MAX_RETRIES}) reason=${reason}`
+      );
+
+      const lastAttempt = attempt === MAX_RETRIES;
+      if (lastAttempt) return false;
+
+      const delayMs = getRetryDelayMs(attempt);
       console.log(`[Telegram] 🔁 retrying ${chatId} in ${delayMs}ms...`);
       await sleep(delayMs);
     }
@@ -131,8 +133,7 @@ export async function broadcastAlert(
     const batch = alert.chatIds.slice(i, i + BATCH_SIZE);
 
     console.log(
-      `[Telegram] 🚀 sending batch ${Math.floor(i / BATCH_SIZE) + 1} ` +
-        `(${batch.length} recipients)`
+      `[Telegram] 🚀 sending batch ${Math.floor(i / BATCH_SIZE) + 1} (${batch.length} recipients)`
     );
 
     const results = await Promise.all(
@@ -144,8 +145,7 @@ export async function broadcastAlert(
     sentCount += successInBatch;
 
     console.log(
-      `[Telegram] 📊 batch result: success=${successInBatch}, failed=${failedInBatch}, ` +
-        `totalSuccess=${sentCount}`
+      `[Telegram] 📊 batch result: success=${successInBatch}, failed=${failedInBatch}, totalSuccess=${sentCount}`
     );
 
     const hasNextBatch = i + BATCH_SIZE < alert.chatIds.length;
